@@ -1,0 +1,139 @@
+workflows:
+  mac-remote:
+    name: Mac Remote Session
+    instance_type: mac_mini_m2
+    max_build_duration: 120
+
+    environment:
+      groups:
+        # Create ONCE in Codemagic UI (mark all Secure):
+        #   TS_AUTHKEY    - Tailscale reusable + ephemeral auth key
+        #   MAC_PASSWORD  - password for user "builder"
+        #   VNC_PASSWORD  - max 8 chars (legacy VNC fallback)
+        #   GIT_PUSH_URL  - (optional) https://TOKEN@github.com/you/backup.git
+        - remote_access
+      vars:
+        SESSION_MINUTES: "112"
+        RES_W: "1920"      # lower (1600x900 / 1280x720) = smoother
+        RES_H: "1080"
+
+    cache:
+      cache_paths:
+        - $HOME/Library/Caches/Homebrew
+
+    scripts:
+      - name: 1. Tailscale (with built-in SSH, no keys needed)
+        script: |
+          set -e
+          brew install tailscale
+          sudo tailscaled install-system-daemon || (sudo nohup tailscaled >/tmp/tailscaled.log 2>&1 &)
+          sleep 5
+          sudo tailscale up \
+            --authkey="$TS_AUTHKEY" \
+            --hostname=codemagic-mac \
+            --accept-dns=false \
+            --ssh
+          echo "TAILSCALE IP: $(tailscale ip -4)"
+
+      - name: 2. Enable Screen Sharing + SSH
+        script: |
+          sudo dscl . -passwd /Users/builder "$MAC_PASSWORD" || true
+
+          # SSH (regular, as backup to Tailscale SSH)
+          sudo launchctl enable system/com.openssh.sshd || true
+          sudo launchctl load -w /System/Library/LaunchDaemons/ssh.plist || true
+
+          # Screen Sharing (High Performance mode works with Apple's client / Screens 5)
+          sudo launchctl enable system/com.apple.screensharing || true
+          sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist || true
+          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
+            -activate -configure -access -on \
+            -clientopts -setvnclegacy -vnclegacy yes \
+            -clientopts -setvncpw -vncpw "$VNC_PASSWORD" \
+            -restart -agent -privs -all || true
+
+      - name: 2b. Fix black screen (wake + unlock + no lock)
+        script: |
+          # Turn off screen lock / screensaver so the desktop never goes black
+          sudo sysadminctl -screenLock off -password "$MAC_PASSWORD" 2>/dev/null || true
+          defaults -currentHost write com.apple.screensaver idleTime 0 || true
+          defaults write com.apple.screensaver askForPassword -int 0 || true
+          # Auto-login so a real desktop session always exists
+          sudo defaults write /Library/Preferences/com.apple.loginwindow autoLoginUser builder || true
+          # Wake the display and keep it awake
+          caffeinate -u -t 5 || true
+          sudo pmset -a displaysleep 0 sleep 0 disablesleep 1 || true
+          # Restart the screen-sharing agent so it attaches to the live desktop
+          sudo killall screensharingd 2>/dev/null || true
+          sudo killall ARDAgent 2>/dev/null || true
+          sleep 3
+          echo "Desktop session users:"; who || true
+
+      - name: 3. Speed tuning (60fps / low lag)
+        script: |
+          # --- Never sleep ---
+          sudo pmset -a displaysleep 0 sleep 0 disablesleep 1 || true
+          caffeinate -dimsu &
+
+          # --- Kill every animation and transparency effect (huge for remote lag) ---
+          defaults write com.apple.universalaccess reduceMotion -bool true || true
+          defaults write com.apple.universalaccess reduceTransparency -bool true || true
+          defaults write NSGlobalDomain NSAutomaticWindowAnimationsEnabled -bool false
+          defaults write NSGlobalDomain NSWindowResizeTime -float 0.001
+          defaults write NSGlobalDomain NSScrollAnimationEnabled -bool false
+          defaults write com.apple.dock autohide-time-modifier -float 0
+          defaults write com.apple.dock autohide-delay -float 0
+          defaults write com.apple.dock launchanim -bool false
+          defaults write com.apple.dock expose-animation-duration -float 0
+          defaults write com.apple.finder DisableAllAnimations -bool true
+          killall Dock Finder SystemUIServer 2>/dev/null || true
+
+          # --- Free CPU for the screen encoder ---
+          sudo mdutil -a -i off 2>/dev/null || true       # stop Spotlight indexing
+          sudo launchctl disable system/com.apple.mds 2>/dev/null || true
+          sudo killall -STOP mds mds_stores 2>/dev/null || true
+
+          # --- Network: send packets immediately ---
+          sudo sysctl -w net.inet.tcp.delayed_ack=0 || true
+          sudo sysctl -w net.inet.tcp.mssdflt=1440 || true
+
+          # --- Set resolution + 60Hz ---
+          brew install displayplacer || true
+          ID=$(displayplacer list 2>/dev/null | awk '/Persistent screen id/ {print $4; exit}')
+          if [ -n "$ID" ]; then
+            displayplacer "id:$ID res:${RES_W}x${RES_H} hz:60 color_depth:8 scaling:off" || true
+          fi
+          displayplacer list || true
+
+      - name: 4. Your setup (edit me)
+        script: |
+          # git clone https://github.com/you/yourrepo.git ~/work
+          # brew install node
+          echo "Setup done"
+
+      - name: 5. Check connection quality
+        script: |
+          echo "=========================================="
+          echo "IP:   $(tailscale ip -4)     user: builder"
+          echo "Connect: Screens / Screen Sharing -> $(tailscale ip -4)"
+          echo "SSH:  ssh builder@codemagic-mac"
+          echo "=========================================="
+          tailscale netcheck 2>&1 | head -20 || true
+          echo "From YOUR device run:  tailscale ping codemagic-mac"
+          echo "It must say 'via <ip>:port' (DIRECT). If it says 'via DERP' it is relayed = laggy."
+
+      - name: 6. Keep alive
+        script: |
+          END=$(( $(date +%s) + SESSION_MINUTES * 60 ))
+          echo "End early + save cache:  ssh builder@codemagic-mac 'touch /tmp/stop'"
+          while [ "$(date +%s)" -lt "$END" ] && [ ! -f /tmp/stop ]; do
+            if [ -n "$GIT_PUSH_URL" ] && [ -d "$HOME/work/.git" ]; then
+              ( cd "$HOME/work" \
+                && git add -A \
+                && git -c user.name=bot -c user.email=bot@example.com commit -qm "autosave" \
+                && git push -q "$GIT_PUSH_URL" HEAD:autosave --force ) || true
+            fi
+            sleep 60
+          done
+          echo "Session finished cleanly"
+          exit 0
