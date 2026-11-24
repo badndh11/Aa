@@ -5,7 +5,7 @@ workflows:
     max_build_duration: 120
     environment:
       groups:
-        - "remote-access"
+        - "remote_access"
     scripts:
       - name: Tailscale
         script: |
